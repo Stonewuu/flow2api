@@ -151,11 +151,10 @@ class BrowserCaptchaService:
         self._resident_tabs: dict[str, 'ResidentTabInfo'] = {}  # project_id -> 常驻标签页信息
         self._resident_lock = asyncio.Lock()  # 保护常驻标签页操作
         
-        # 标签页变化检测：当检测到外部标签页变化（如插件打开/关闭标签页）时
-        # 将常驻标签页标记为 dirty，在下次 get_token() 时主动重建
+        # 标签页状态管理：当 reCAPTCHA token 被上游拒绝时（如插件更新 ST 后），
+        # 通过 invalidate_resident_tabs() 将常驻标签页标记为 dirty，
+        # 在下次 get_token() 重试时主动重建
         self._dirty_projects: set = set()  # 需要重建的 project_id 集合
-        self._expected_tab_count: int = 0  # 预期的标签页数量（我们自己管理的）
-        self._tab_monitor_task: Optional[asyncio.Task] = None  # 标签页监控任务
         
         # 兼容旧 API（保留 single resident 属性作为别名）
         self.resident_project_id: Optional[str] = None  # 向后兼容
@@ -230,9 +229,6 @@ class BrowserCaptchaService:
 
             self._initialized = True
             debug_logger.log_info(f"[BrowserCaptcha] ✅ nodriver 浏览器已启动 (Profile: {self.user_data_dir})")
-            
-            # 启动标签页变化监控
-            await self._start_tab_monitor()
 
         except Exception as e:
             debug_logger.log_error(f"[BrowserCaptcha] ❌ 浏览器启动失败: {str(e)}")
@@ -741,15 +737,12 @@ class BrowserCaptchaService:
         await self.initialize()
         self._last_fingerprint = None
         
-        # 检查是否有外部标签页变化（如插件触发了 ST 更新）
-        await self._check_tab_changes()
-        
-        # 如果该 project_id 被标记为 dirty（外部标签页变化导致），先重建
+        # 如果该 project_id 被标记为 dirty（reCAPTCHA 失败后标记），先重建
         need_rebuild = project_id in self._dirty_projects
         if need_rebuild:
             debug_logger.log_warning(
-                f"[BrowserCaptcha] project_id={project_id} 被标记为 dirty（可能是插件更新 ST 导致），"
-                f"主动重建常驻标签页以确保 reCAPTCHA 上下文有效"
+                f"[BrowserCaptcha] project_id={project_id} 被标记为 dirty（reCAPTCHA 上下文可能已失效），"
+                f"主动重建常驻标签页"
             )
             async with self._resident_lock:
                 self._dirty_projects.discard(project_id)
@@ -862,9 +855,6 @@ class BrowserCaptchaService:
             
             debug_logger.log_info(f"[BrowserCaptcha] ✅ 常驻标签页创建成功 (project: {project_id})")
             
-            # 更新预期标签页数量
-            self._update_expected_tab_count()
-            
             return resident_info
             
         except Exception as e:
@@ -884,133 +874,14 @@ class BrowserCaptchaService:
                 debug_logger.log_info(f"[BrowserCaptcha] 已关闭 project_id={project_id} 的常驻标签页")
             except Exception as e:
                 debug_logger.log_warning(f"[BrowserCaptcha] 关闭标签页时异常: {e}")
-        
-        # 更新预期标签页数量
-        self._update_expected_tab_count()
 
-    # ========== 标签页变化检测 ==========
-
-    def _get_current_tab_count(self) -> int:
-        """获取当前浏览器的标签页数量"""
-        if not self.browser:
-            return 0
-        try:
-            # nodriver 的 browser.tabs 属性返回当前打开的标签页列表
-            tabs = getattr(self.browser, 'tabs', None)
-            if tabs is not None:
-                return len(tabs)
-            # 兼容不同版本的 nodriver API
-            targets = getattr(self.browser, 'targets', None)
-            if targets is not None:
-                return len([t for t in targets if hasattr(t, 'url')])
-            return 0
-        except Exception:
-            return 0
-
-    def _update_expected_tab_count(self):
-        """更新预期的标签页数量（基于我们管理的标签页）"""
-        # 预期标签页数 = 常驻标签页数 + 自定义标签页数 + 1（初始空白页）
-        resident_count = len(self._resident_tabs)
-        custom_count = len(self._custom_tabs)
-        self._expected_tab_count = resident_count + custom_count + 1  # +1 for main/blank tab
-
-    async def _start_tab_monitor(self):
-        """启动标签页变化监控后台任务"""
-        if self._tab_monitor_task and not self._tab_monitor_task.done():
-            return
-        
-        self._update_expected_tab_count()
-        self._tab_monitor_task = asyncio.create_task(self._tab_monitor_loop())
-        debug_logger.log_info("[BrowserCaptcha] 标签页变化监控已启动")
-
-    async def _stop_tab_monitor(self):
-        """停止标签页变化监控"""
-        if self._tab_monitor_task and not self._tab_monitor_task.done():
-            self._tab_monitor_task.cancel()
-            try:
-                await self._tab_monitor_task
-            except asyncio.CancelledError:
-                pass
-            self._tab_monitor_task = None
-            debug_logger.log_info("[BrowserCaptcha] 标签页变化监控已停止")
-
-    async def _tab_monitor_loop(self):
-        """后台轮询检测标签页数量变化
-        
-        当检测到标签页数量与预期不一致时（说明有外部操作如插件打开/关闭了标签页），
-        将所有常驻标签页标记为 dirty。
-        """
-        try:
-            while True:
-                await asyncio.sleep(2)  # 每 2 秒检查一次
-                
-                if not self._initialized or not self.browser:
-                    continue
-                
-                try:
-                    current_count = self._get_current_tab_count()
-                    if current_count == 0:
-                        continue
-                    
-                    expected = self._expected_tab_count
-                    
-                    # 检测到标签页数量变化（外部打开或关闭了标签页）
-                    if current_count != expected:
-                        debug_logger.log_warning(
-                            f"[BrowserCaptcha] 检测到标签页数量变化: "
-                            f"预期={expected}, 实际={current_count}，"
-                            f"可能是插件操作导致，将所有常驻标签页标记为 dirty"
-                        )
-                        
-                        # 将所有常驻标签页标记为 dirty
-                        async with self._resident_lock:
-                            for pid in self._resident_tabs:
-                                self._dirty_projects.add(pid)
-                        
-                        # 更新预期值为当前实际值（避免连续误报）
-                        self._expected_tab_count = current_count
-                        
-                except Exception as e:
-                    debug_logger.log_warning(f"[BrowserCaptcha] 标签页监控异常: {e}")
-                    
-        except asyncio.CancelledError:
-            pass
-
-    async def _check_tab_changes(self):
-        """手动检查标签页变化（在 get_token 调用时同步检查一次）
-        
-        作为后台轮询监控的补充，确保在请求时立即检测到变化。
-        """
-        if not self._initialized or not self.browser:
-            return
-        
-        try:
-            current_count = self._get_current_tab_count()
-            if current_count == 0:
-                return
-            
-            expected = self._expected_tab_count
-            
-            if current_count != expected:
-                debug_logger.log_warning(
-                    f"[BrowserCaptcha] [同步检查] 标签页数量变化: "
-                    f"预期={expected}, 实际={current_count}，"
-                    f"标记所有常驻标签页为 dirty"
-                )
-                
-                async with self._resident_lock:
-                    for pid in self._resident_tabs:
-                        self._dirty_projects.add(pid)
-                
-                # 更新预期值
-                self._expected_tab_count = current_count
-        except Exception as e:
-            debug_logger.log_warning(f"[BrowserCaptcha] 同步检查标签页变化异常: {e}")
+    # ========== 错误驱动的常驻标签页重建 ==========
 
     async def invalidate_resident_tabs(self, project_id: Optional[str] = None):
-        """外部调用：将常驻标签页标记为 dirty，在下次 get_token() 时重建
+        """将常驻标签页标记为 dirty，在下次 get_token() 时重建
         
-        用于上游请求失败（如 reCAPTCHA evaluation failed）时触发重建。
+        当上游请求失败（如 reCAPTCHA evaluation failed）时，由 flow_client 调用此方法。
+        下次 get_token() 时会检测到 dirty 标记，自动关闭旧标签页并重建新的。
         
         Args:
             project_id: 指定要标记 dirty 的 project_id，如果为 None 则标记所有
@@ -1104,9 +975,6 @@ class BrowserCaptchaService:
 
     async def close(self):
         """关闭浏览器"""
-        # 停止标签页监控
-        await self._stop_tab_monitor()
-        
         # 先停止所有常驻模式（关闭所有常驻标签页）
         await self.stop_resident_mode()
         
