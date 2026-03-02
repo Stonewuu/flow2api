@@ -1250,16 +1250,23 @@ class FlowClient:
         return None
 
     async def _notify_browser_captcha_error(self, browser_id: int = None):
-        """通知有头浏览器打码切换指纹（仅当使用 browser 打码方式时）
+        """通知浏览器打码服务 token 验证失败，触发重建
         
         Args:
-            browser_id: 要标记为 bad 的浏览器 ID
+            browser_id: 要标记为 bad 的浏览器 ID（仅 browser 模式使用）
         """
         if config.captcha_method == "browser":
             try:
                 from .browser_captcha import BrowserCaptchaService
                 service = await BrowserCaptchaService.get_instance(self.db)
                 await service.report_error(browser_id)
+            except Exception:
+                pass
+        elif config.captcha_method == "personal":
+            try:
+                from .browser_captcha_personal import BrowserCaptchaService
+                service = await BrowserCaptchaService.get_instance(self.db)
+                await service.invalidate_resident_tabs()
             except Exception:
                 pass
 
@@ -1390,7 +1397,7 @@ class FlowClient:
             return None
 
         website_key = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
-        website_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+        website_url = f"https://labs.google/fx/zh/tools/flow/project/{project_id}"
         page_action = action
 
         try:

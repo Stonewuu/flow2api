@@ -173,7 +173,7 @@ else:
 
 
 # 配置
-LABS_URL = "https://labs.google/fx/tools/flow"
+LABS_URL = "https://labs.google/fx/zh/tools/flow"
 
 # ==========================================
 # 代理解析工具函数
@@ -704,7 +704,7 @@ class TokenBrowser:
             page = await context.new_page()
             await page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
             
-            page_url = f"https://labs.google/fx/tools/flow/project/{project_id}"
+            page_url = f"https://labs.google/fx/zh/tools/flow/project/{project_id}"
             primary_host = "https://www.recaptcha.net" if self._browser_proxy_active else "https://www.google.com"
             secondary_host = "https://www.google.com" if primary_host == "https://www.recaptcha.net" else "https://www.recaptcha.net"
             debug_logger.log_info(
