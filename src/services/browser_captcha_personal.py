@@ -849,6 +849,19 @@ class BrowserCaptchaService:
                     pass
                 return None
             
+            # reCAPTCHA API 可用后，额外等待确保内部上下文完全初始化
+            # grecaptcha.enterprise.execute 可调用 ≠ 内部 session/site-key 绑定完成
+            settle_seconds = 3
+            try:
+                settle_seconds = float(getattr(config, "browser_recaptcha_settle_seconds", 3) or 3)
+            except Exception:
+                pass
+            if settle_seconds > 0:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] reCAPTCHA 已就绪，额外等待 {settle_seconds:.1f}s 确保上下文完全初始化..."
+                )
+                await asyncio.sleep(settle_seconds)
+            
             # 创建常驻信息对象
             resident_info = ResidentTabInfo(tab, project_id)
             resident_info.recaptcha_ready = True

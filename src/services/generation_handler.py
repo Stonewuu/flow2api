@@ -956,7 +956,7 @@ class GenerationHandler:
                         )
                         # 通知打码服务当前 token 有问题，触发标签页重建
                         await self.flow_client._notify_browser_captcha_error()
-                        await asyncio.sleep(1)
+                        await asyncio.sleep(2)  # 等待足够时间让旧标签页资源清理
                         continue
                     else:
                         raise e
