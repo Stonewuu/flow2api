@@ -1071,8 +1071,12 @@ class GenerationHandler:
                         if retry_reason and retry_attempt < max_retries - 1:
                             if stream:
                                 yield self._create_stream_chunk(f"⚠️ 放大遇到{retry_reason}，正在重试 ({retry_attempt + 2}/{max_retries})...\n")
-                            # 等待一小段时间后重试
-                            await asyncio.sleep(1)
+                            debug_logger.log_warning(
+                                f"[UPSAMPLE] 放大遇到{retry_reason}，重试 ({retry_attempt + 2}/{max_retries})..."
+                            )
+                            # 通知打码服务当前 token 有问题，触发标签页重建
+                            await self.flow_client._notify_browser_captcha_error()
+                            await asyncio.sleep(2)  # 等待足够时间让旧标签页资源清理
                             continue
                         else:
                             if stream:
