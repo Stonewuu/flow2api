@@ -569,7 +569,8 @@ class FlowClient:
         prompt: str,
         model_name: str,
         aspect_ratio: str,
-        image_inputs: Optional[List[Dict]] = None
+        image_inputs: Optional[List[Dict]] = None,
+        max_retries: int = 3
     ) -> tuple[dict, str]:
         """生成图片(同步返回)
 
@@ -580,6 +581,7 @@ class FlowClient:
             model_name: NARWHAL / GEM_PIX / GEM_PIX_2 / IMAGEN_3_5
             aspect_ratio: 图片宽高比
             image_inputs: 参考图片列表(图生图时使用)
+            max_retries: 最大重试次数，默认3次。外部有重试逻辑时可传1禁用内部重试
 
         Returns:
             (result, session_id)
@@ -588,8 +590,7 @@ class FlowClient:
         """
         url = f"{self.api_base_url}/projects/{project_id}/flowMedia:batchGenerateImages"
 
-        # 403/reCAPTCHA 重试逻辑 - 最多重试3次
-        max_retries = 3
+        # 403/reCAPTCHA 重试逻辑
         last_error = None
         
         for retry_attempt in range(max_retries):

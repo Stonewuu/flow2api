@@ -921,18 +921,48 @@ class GenerationHandler:
                     if stream:
                         yield self._create_stream_chunk(f"已上传第 {idx + 1}/{len(images)} 张图片\n")
 
-            # 调用生成API
+            # 调用生成API（带重试和流式提示）
             if stream:
                 yield self._create_stream_chunk("正在生成图片...\n")
 
-            result, generation_session_id = await self.flow_client.generate_image(
-                at=token.at,
-                project_id=project_id,
-                prompt=prompt,
-                model_name=model_config["model_name"],
-                aspect_ratio=model_config["aspect_ratio"],
-                image_inputs=image_inputs
-            )
+            max_gen_retries = 3
+            result = None
+            generation_session_id = None
+            last_gen_error = None
+
+            for gen_retry in range(max_gen_retries):
+                try:
+                    result, generation_session_id = await self.flow_client.generate_image(
+                        at=token.at,
+                        project_id=project_id,
+                        prompt=prompt,
+                        model_name=model_config["model_name"],
+                        aspect_ratio=model_config["aspect_ratio"],
+                        image_inputs=image_inputs,
+                        max_retries=1  # 禁用内部重试，由此处统一控制
+                    )
+                    break  # 成功则跳出重试循环
+                except Exception as e:
+                    last_gen_error = e
+                    error_str = str(e)
+                    retry_reason = self.flow_client._get_retry_reason(error_str)
+                    if retry_reason and gen_retry < max_gen_retries - 1:
+                        if stream:
+                            yield self._create_stream_chunk(
+                                f"⚠️ 生成遇到{retry_reason}，正在重试 ({gen_retry + 2}/{max_gen_retries})...\n"
+                            )
+                        debug_logger.log_warning(
+                            f"[IMAGE] 生成遇到{retry_reason}，Handler层重试 ({gen_retry + 2}/{max_gen_retries})..."
+                        )
+                        # 通知打码服务当前 token 有问题，触发标签页重建
+                        await self.flow_client._notify_browser_captcha_error()
+                        await asyncio.sleep(1)
+                        continue
+                    else:
+                        raise e
+
+            if result is None:
+                raise last_gen_error
 
             # 提取URL和mediaId
             media = result.get("media", [])
