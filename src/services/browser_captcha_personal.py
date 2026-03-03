@@ -341,17 +341,19 @@ class BrowserCaptchaService:
         """
         debug_logger.log_info("[BrowserCaptcha] 检测 reCAPTCHA...")
         
-        # 检查 grecaptcha.enterprise.execute
-        is_enterprise = await tab.evaluate(
-            "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function'"
-        )
+        # 先轮询等待页面自身的 reCAPTCHA 脚本加载（最多等 5 秒）
+        # 页面刷新后脚本需要时间加载，不能立即判定不存在就注入，否则会重复注入导致冲突
+        for wait_i in range(10):
+            is_enterprise = await tab.evaluate(
+                "typeof grecaptcha !== 'undefined' && typeof grecaptcha.enterprise !== 'undefined' && typeof grecaptcha.enterprise.execute === 'function'"
+            )
+            if is_enterprise:
+                debug_logger.log_info(f"[BrowserCaptcha] reCAPTCHA Enterprise 已加载（等待了 {wait_i * 0.5:.1f}s）")
+                return True
+            await tab.sleep(0.5)
         
-        if is_enterprise:
-            debug_logger.log_info("[BrowserCaptcha] reCAPTCHA Enterprise 已加载")
-            return True
-        
-        # 尝试注入脚本
-        debug_logger.log_info("[BrowserCaptcha] 未检测到 reCAPTCHA，注入脚本...")
+        # 页面自身未加载 reCAPTCHA，尝试手动注入脚本
+        debug_logger.log_info("[BrowserCaptcha] 等待 5s 后仍未检测到 reCAPTCHA，注入脚本...")
         
         await tab.evaluate(f"""
             (() => {{
@@ -737,16 +739,27 @@ class BrowserCaptchaService:
         await self.initialize()
         self._last_fingerprint = None
         
-        # 如果该 project_id 被标记为 dirty（reCAPTCHA 失败后标记），先重建
-        need_rebuild = project_id in self._dirty_projects
-        if need_rebuild:
+        # 如果该 project_id 被标记为 dirty（reCAPTCHA 失败后标记），在当前标签页刷新
+        need_refresh = project_id in self._dirty_projects
+        if need_refresh:
             debug_logger.log_warning(
                 f"[BrowserCaptcha] project_id={project_id} 被标记为 dirty（reCAPTCHA 上下文可能已失效），"
-                f"主动重建常驻标签页"
+                f"在当前标签页刷新页面"
             )
             async with self._resident_lock:
                 self._dirty_projects.discard(project_id)
-                await self._close_resident_tab(project_id)
+                resident_info = self._resident_tabs.get(project_id)
+                if resident_info and resident_info.tab:
+                    refreshed = await self._refresh_resident_tab(resident_info)
+                    if not refreshed:
+                        # 刷新失败，fallback 到关闭+重建
+                        debug_logger.log_warning(
+                            f"[BrowserCaptcha] 标签页刷新失败，fallback 到关闭重建"
+                        )
+                        await self._close_resident_tab(project_id)
+                else:
+                    # 标签页不存在，后续会自动创建
+                    pass
         
         # 尝试从常驻标签页获取 token
         async with self._resident_lock:
@@ -778,8 +791,22 @@ class BrowserCaptchaService:
             except Exception as e:
                 debug_logger.log_warning(f"[BrowserCaptcha] 常驻标签页异常: {e}，尝试重建...")
             
-            # 常驻标签页失效，尝试重建
+            # 常驻标签页失效，优先尝试刷新，失败才重建
             async with self._resident_lock:
+                refreshed = await self._refresh_resident_tab(resident_info)
+                if refreshed:
+                    # 刷新成功，立即尝试生成
+                    try:
+                        token = await self._execute_recaptcha_on_tab(resident_info.tab, action)
+                        if token:
+                            self._last_fingerprint = await self._extract_tab_fingerprint(resident_info.tab)
+                            debug_logger.log_info(f"[BrowserCaptcha] ✅ 刷新后 Token生成成功")
+                            return token
+                    except Exception:
+                        pass
+                
+                # 刷新失败或刷新后仍生成失败，fallback 到关闭+重建
+                debug_logger.log_warning(f"[BrowserCaptcha] 刷新方式失败，fallback 到关闭+重建")
                 await self._close_resident_tab(project_id)
                 resident_info = await self._create_resident_tab(project_id)
                 if resident_info:
@@ -887,6 +914,77 @@ class BrowserCaptchaService:
                 debug_logger.log_info(f"[BrowserCaptcha] 已关闭 project_id={project_id} 的常驻标签页")
             except Exception as e:
                 debug_logger.log_warning(f"[BrowserCaptcha] 关闭标签页时异常: {e}")
+
+    async def _refresh_resident_tab(self, resident_info: ResidentTabInfo) -> bool:
+        """在当前标签页中刷新页面，重新加载 reCAPTCHA 上下文
+        
+        比关闭+新建标签页更快，避免新建标签页的开销。
+        
+        Args:
+            resident_info: 常驻标签页信息
+            
+        Returns:
+            True if 刷新成功, False if 刷新失败（需要 fallback 到关闭+重建）
+        """
+        tab = resident_info.tab
+        project_id = resident_info.project_id
+        
+        try:
+            website_url = f"https://labs.google/fx/zh/tools/flow/project/{project_id}"
+            debug_logger.log_info(f"[BrowserCaptcha] 在当前标签页刷新页面: {website_url}")
+            
+            # 在当前标签页导航到新 URL
+            await tab.get(website_url)
+            
+            # 等待页面加载完成
+            page_loaded = False
+            for retry in range(60):
+                try:
+                    await asyncio.sleep(1)
+                    ready_state = await tab.evaluate("document.readyState")
+                    if ready_state == "complete":
+                        page_loaded = True
+                        break
+                except ConnectionRefusedError as e:
+                    debug_logger.log_warning(f"[BrowserCaptcha] 刷新时标签页连接丢失: {e}")
+                    return False
+                except Exception as e:
+                    debug_logger.log_warning(f"[BrowserCaptcha] 刷新等待页面异常: {e}，重试 {retry + 1}/60...")
+                    await asyncio.sleep(1)
+            
+            if not page_loaded:
+                debug_logger.log_error(f"[BrowserCaptcha] 刷新后页面加载超时 (project: {project_id})")
+                return False
+            
+            # 等待 reCAPTCHA 加载
+            recaptcha_ready = await self._wait_for_recaptcha(tab)
+            
+            if not recaptcha_ready:
+                debug_logger.log_error(f"[BrowserCaptcha] 刷新后 reCAPTCHA 加载失败 (project: {project_id})")
+                return False
+            
+            # reCAPTCHA API 可用后，额外等待确保内部上下文完全初始化
+            settle_seconds = 3
+            try:
+                settle_seconds = float(getattr(config, "browser_recaptcha_settle_seconds", 3) or 3)
+            except Exception:
+                pass
+            if settle_seconds > 0:
+                debug_logger.log_info(
+                    f"[BrowserCaptcha] 刷新后 reCAPTCHA 已就绪，额外等待 {settle_seconds:.1f}s 确保上下文完全初始化..."
+                )
+                await asyncio.sleep(settle_seconds)
+            
+            # 更新状态
+            resident_info.recaptcha_ready = True
+            resident_info.created_at = time.time()
+            
+            debug_logger.log_info(f"[BrowserCaptcha] ✅ 标签页刷新成功 (project: {project_id})")
+            return True
+            
+        except Exception as e:
+            debug_logger.log_error(f"[BrowserCaptcha] 标签页刷新异常: {e}")
+            return False
 
     # ========== 错误驱动的常驻标签页重建 ==========
 
